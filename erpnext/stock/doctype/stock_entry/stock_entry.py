@@ -19,8 +19,6 @@ from frappe.utils import (
 )
 
 import erpnext
-from erpnext.accounts.general_ledger import process_gl_map
-from erpnext.accounts.utils import get_account_currency
 from erpnext.buying.utils import check_on_hold_or_closed_status
 from erpnext.controllers.taxes_and_totals import init_landed_taxes_and_totals
 from erpnext.manufacturing.doctype.bom.bom import (
@@ -39,20 +37,20 @@ from erpnext.stock.get_item_details import (
 from erpnext.stock.stock_ledger import get_previous_sle, get_valuation_rate
 from erpnext.stock.utils import get_incoming_rate
 
-from .stock_entry_handler.disassemble import DisassembleStockEntry
-from .stock_entry_handler.manufacturing import (
+from .services.disassemble import DisassembleStockEntry
+from .services.manufacturing import (
 	ManufactureStockEntry,
 	MaterialConsumptionForManufactureStockEntry,
 	RepackStockEntry,
 )
-from .stock_entry_handler.material_receipt_issue import MaterialIssueStockEntry, MaterialReceiptStockEntry
-from .stock_entry_handler.material_transfer import (
+from .services.material_receipt_issue import MaterialIssueStockEntry, MaterialReceiptStockEntry
+from .services.material_transfer import (
 	MaterialRequestStockEntry,
 	MaterialTransferForManufactureStockEntry,
 	MaterialTransferStockEntry,
 )
-from .stock_entry_handler.serial_batch import StockEntrySABB
-from .stock_entry_handler.subcontracting import SendToSubcontractorStockEntry
+from .services.serial_batch import StockEntrySABB
+from .services.subcontracting import SendToSubcontractorStockEntry
 
 
 class FinishedGoodError(frappe.ValidationError):
@@ -267,17 +265,22 @@ class StockEntry(StockController, SubcontractingInwardController):
 				)
 
 	def validate(self):
+		from erpnext.stock.doctype.putaway_rule.putaway_rule import validate_putaway_capacity
+		from erpnext.stock.services.serial_batch_bundle_service import SerialBatchBundleService
+
+		sbb = SerialBatchBundleService(self)
+
 		if self.purpose_cls:
 			self.purpose_cls(self).validate()
 
-		self.validate_duplicate_serial_and_batch_bundle("items")
+		sbb.validate_duplicate_serial_and_batch_bundle("items")
 		self.validate_posting_time()
 		self.validate_item()
 		self.validate_customer_provided_item()
 		self.set_transfer_qty()
 		self.validate_uom_is_integer("uom", "qty")
 		self.validate_uom_is_integer("stock_uom", "transfer_qty")
-		self.validate_warehouse_of_sabb()
+		sbb.validate_warehouse_of_sabb()
 		self.validate_source_stock_entry()
 		self.validate_bom()
 		self.set_process_loss_qty()
@@ -290,17 +293,23 @@ class StockEntry(StockController, SubcontractingInwardController):
 			else:
 				self.validate_job_card_fg_item()
 
+		# Disassembly rows are fully derived from the source manufacture entry / work order;
+		# verify the posted stock quantities have not been tampered with (raw-material minting).
+		# Must run after set_transfer_qty() so row.transfer_qty reflects qty * conversion_factor.
+		if self.purpose == "Disassemble" and self.purpose_cls:
+			self.purpose_cls(self).validate_disassembly_quantities()
+
 		self.validate_batch()
 		self.validate_inspection()
 		self.validate_fg_completed_qty()
 		self.validate_difference_account()
 		self.validate_job_card_item()
 		self.set_purpose_for_stock_entry()
-		self.clean_serial_nos()
+		sbb.clean_serial_nos()
 		self.remove_fg_completed_qty()
-		self.validate_serialized_batch()
+		sbb.validate_serialized_batch()
 		self.calculate_rate_and_amount()
-		self.validate_putaway_capacity()
+		validate_putaway_capacity(self)
 		self.validate_closed_subcontracting_order()
 		super().validate_subcontracting_inward()
 
@@ -318,6 +327,9 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.make_bundle_using_old_serial_batch_fields()
 		self.adjust_stock_reservation_entries_for_return()
 		self.update_stock_reservation_entries()
+		# Release the Work Order's own reservation for items being sent to the subcontractor
+		# before the negative-stock guard runs in update_stock_ledger().
+		self.update_wo_reservation_for_subcontracting()
 		self.update_stock_ledger()
 		self.make_stock_reserve_for_wip_and_fg()
 		self.reserve_stock_for_subcontracting()
@@ -359,6 +371,8 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.update_quality_inspection()
 		self.adjust_stock_reservation_entries_for_return()
 		self.update_stock_reservation_entries()
+		# Recompute (now excludes this cancelled entry) so the freed reservation is restored.
+		self.update_wo_reservation_for_subcontracting()
 		self.delete_auto_created_batches()
 		self.delete_linked_stock_entry()
 		super().on_cancel_subcontracting_inward()
@@ -436,7 +450,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		for project in projects:
 			project_doc = frappe.get_doc("Project", project)
 			project_doc.set_consumed_material_cost()
-			project_doc.save()
+			project_doc.save(ignore_permissions=True)
 
 	def validate_item(self):
 		for item in self.get("items"):
@@ -540,6 +554,13 @@ class StockEntry(StockController, SubcontractingInwardController):
 		for d in self.get("items"):
 			if d.s_warehouse or d.set_basic_rate_manually:
 				continue
+
+			# Zero-qty secondary items carry no inventory value; skip rate calculation
+			if d.secondary_item_type and flt(d.transfer_qty) == 0:
+				d.basic_rate = 0.0
+				d.basic_amount = 0.0
+				continue
+
 			self._set_incoming_item_rate(d, outgoing_items_cost, raise_error_if_no_rate, zero_valuation_items)
 
 		if zero_valuation_items:
@@ -561,7 +582,10 @@ class StockEntry(StockController, SubcontractingInwardController):
 			cost_allocation_per = frappe.get_value(
 				"BOM Secondary Item", d.bom_secondary_item, "cost_allocation_per"
 			)
-			d.basic_rate = (outgoing_items_cost * (cost_allocation_per / 100)) / d.transfer_qty
+			# Only recalculate when cost is actually allocated; otherwise preserve the
+			# user-entered rate (or fall through to get_valuation_rate below)
+			if cost_allocation_per and flt(d.transfer_qty):
+				d.basic_rate = (outgoing_items_cost * (cost_allocation_per / 100)) / d.transfer_qty
 
 		if not d.basic_rate and not d.allow_zero_valuation_rate:
 			d.basic_rate = get_valuation_rate(
@@ -1035,137 +1059,9 @@ class StockEntry(StockController, SubcontractingInwardController):
 				sl_entries.append(sle)
 
 	def get_gl_entries(self, inventory_account_map):
-		gl_entries = super().get_gl_entries(inventory_account_map)
+		from erpnext.stock.doctype.stock_entry.services.gl_composer import StockEntryGLComposer
 
-		if self.purpose in ("Repack", "Manufacture"):
-			total_basic_amount = sum(flt(t.basic_amount) for t in self.get("items") if t.is_finished_item)
-		else:
-			total_basic_amount = sum(flt(t.basic_amount) for t in self.get("items") if t.t_warehouse)
-
-		divide_based_on = total_basic_amount
-		if self.get("additional_costs") and not total_basic_amount:
-			divide_based_on = sum(item.qty for item in self.get("items"))
-
-		item_account_wise_additional_cost = self._build_additional_cost_per_item_account(
-			total_basic_amount, divide_based_on
-		)
-
-		if item_account_wise_additional_cost:
-			self._append_additional_cost_gl_entries(gl_entries, item_account_wise_additional_cost)
-
-		self.set_gl_entries_for_landed_cost_voucher(gl_entries, inventory_account_map)
-		return process_gl_map(gl_entries, from_repost=frappe.flags.through_repost_item_valuation)
-
-	def _build_additional_cost_per_item_account(self, total_basic_amount, divide_based_on):
-		item_account_wise_additional_cost = {}
-
-		for t in self.get("additional_costs"):
-			for d in self.get("items"):
-				if self.purpose in ("Repack", "Manufacture") and not d.is_finished_item:
-					continue
-				elif not d.t_warehouse:
-					continue
-
-				item_account_wise_additional_cost.setdefault((d.item_code, d.name), {})
-				item_account_wise_additional_cost[(d.item_code, d.name)].setdefault(
-					t.expense_account, {"amount": 0.0, "base_amount": 0.0}
-				)
-
-				multiply_based_on = d.basic_amount if total_basic_amount else d.qty
-				entry = item_account_wise_additional_cost[(d.item_code, d.name)][t.expense_account]
-				entry["amount"] += flt(t.amount * multiply_based_on) / divide_based_on
-				entry["base_amount"] += flt(t.base_amount * multiply_based_on) / divide_based_on
-
-		return item_account_wise_additional_cost
-
-	def _append_additional_cost_gl_entries(self, gl_entries, item_account_wise_additional_cost):
-		for d in self.get("items"):
-			for account, amount in item_account_wise_additional_cost.get((d.item_code, d.name), {}).items():
-				if not amount:
-					continue
-
-				gl_entries.append(
-					self.get_gl_dict(
-						{
-							"account": account,
-							"against": d.expense_account,
-							"cost_center": d.cost_center,
-							"remarks": self.get("remarks") or _("Accounting Entry for Stock"),
-							"credit_in_account_currency": flt(amount["amount"]),
-							"credit": flt(amount["base_amount"]),
-						},
-						item=d,
-					)
-				)
-
-				gl_entries.append(
-					self.get_gl_dict(
-						{
-							"account": d.expense_account,
-							"against": account,
-							"cost_center": d.cost_center,
-							"remarks": self.get("remarks") or _("Accounting Entry for Stock"),
-							"credit": -1 * amount["base_amount"],  # negative credit instead of debit
-						},
-						item=d,
-					)
-				)
-
-	def set_gl_entries_for_landed_cost_voucher(self, gl_entries, inventory_account_map):
-		landed_cost_entries = self.get_item_account_wise_lcv_entries()
-		if not landed_cost_entries:
-			return
-
-		for item in self.get("items"):
-			if item.s_warehouse:
-				continue
-
-			if (item.item_code, item.name) in landed_cost_entries:
-				for account, amount in landed_cost_entries[(item.item_code, item.name)].items():
-					account_currency = get_account_currency(account)
-					credit_amount = (
-						flt(amount["base_amount"])
-						if (amount["base_amount"] or account_currency != self.company_currency)
-						else flt(amount["amount"])
-					)
-
-					_inv_dict = self.get_inventory_account_dict(item, inventory_account_map, "t_warehouse")
-					gl_entries.append(
-						self.get_gl_dict(
-							{
-								"account": account,
-								"against": _inv_dict["account"],
-								"cost_center": item.cost_center,
-								"debit": 0.0,
-								"credit": credit_amount,
-								"remarks": _("Accounting Entry for LCV in Stock Entry {0}").format(self.name),
-								"credit_in_account_currency": flt(amount["amount"]),
-								"account_currency": account_currency,
-								"project": item.project,
-							},
-							item=item,
-						)
-					)
-
-					account_currency = get_account_currency(item.expense_account)
-
-					# credit amount in negative to knock off the debit entry
-					gl_entries.append(
-						self.get_gl_dict(
-							{
-								"account": item.expense_account,
-								"against": _inv_dict["account"],
-								"cost_center": item.cost_center,
-								"debit": 0.0,
-								"credit": credit_amount * -1,
-								"remarks": _("Accounting Entry for LCV in Stock Entry {0}").format(self.name),
-								"debit_in_account_currency": flt(amount["amount"]),
-								"account_currency": account_currency,
-								"project": item.project,
-							},
-							item=item,
-						)
-					)
+		return StockEntryGLComposer(self).compose(inventory_account_map)
 
 	@property
 	def pro_doc(self):
@@ -1175,6 +1071,10 @@ class StockEntry(StockController, SubcontractingInwardController):
 		return getattr(self, "_wo_doc", None)
 
 	def make_stock_reserve_for_wip_and_fg(self):
+		from erpnext.manufacturing.doctype.work_order.services.reservation import (
+			WorkOrderStockReservation,
+		)
+
 		if self.is_stock_reserve_for_work_order():
 			pro_doc = frappe.get_doc("Work Order", self.work_order)
 			if (
@@ -1186,7 +1086,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 			):
 				return
 
-			pro_doc.set_reserved_qty_for_wip_and_fg(self)
+			WorkOrderStockReservation(pro_doc).set_reserved_qty_for_wip_and_fg(self)
 
 	def reserve_stock_for_subcontracting(self):
 		if self.purpose == "Send to Subcontractor" and frappe.get_value(
@@ -1213,6 +1113,10 @@ class StockEntry(StockController, SubcontractingInwardController):
 			)
 
 	def cancel_stock_reserve_for_wip_and_fg(self):
+		from erpnext.manufacturing.doctype.work_order.services.reservation import (
+			WorkOrderStockReservation,
+		)
+
 		if self.is_stock_reserve_for_work_order():
 			pro_doc = frappe.get_doc("Work Order", self.work_order)
 			if (
@@ -1222,7 +1126,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 			):
 				return
 
-			pro_doc.cancel_reserved_qty_for_wip_and_fg(self)
+			WorkOrderStockReservation(pro_doc).cancel_reserved_qty_for_wip_and_fg(self)
 
 	def is_stock_reserve_for_work_order(self):
 		if (
@@ -1233,6 +1137,57 @@ class StockEntry(StockController, SubcontractingInwardController):
 			return True
 
 		return False
+
+	def update_wo_reservation_for_subcontracting(self):
+		# A "Send to Subcontractor" entry never keeps its `work_order` (validate clears it for this
+		# purpose), so the owning Work Order is derived from the Subcontracting Order / Purchase Order
+		# that raised the transfer. Each such Work Order that reserves stock gets its reservation for
+		# the sent items released, so the negative-stock guard stops blocking the consumption.
+		from erpnext.manufacturing.doctype.work_order.services.reservation import (
+			WorkOrderStockReservation,
+		)
+
+		if self.purpose != "Send to Subcontractor":
+			return
+
+		for wo_name in self.get_reserved_work_orders_for_subcontracting():
+			pro_doc = frappe.get_doc("Work Order", wo_name)
+			WorkOrderStockReservation(pro_doc).release_reserved_qty_for_subcontract_transfer()
+
+	def get_reserved_work_orders_for_subcontracting(self):
+		job_cards = set()
+		if self.subcontracting_order:
+			job_cards.update(
+				frappe.get_all(
+					"Subcontracting Order Item",
+					filters={"parent": self.subcontracting_order},
+					pluck="job_card",
+				)
+			)
+		if self.purchase_order:
+			job_cards.update(
+				frappe.get_all(
+					"Purchase Order Item", filters={"parent": self.purchase_order}, pluck="job_card"
+				)
+			)
+
+		job_cards = {jc for jc in job_cards if jc}
+		if not job_cards:
+			return []
+
+		work_orders = frappe.get_all(
+			"Job Card", filters={"name": ["in", list(job_cards)]}, pluck="work_order"
+		)
+
+		reserved_work_orders = []
+		for work_order in set(work_orders):
+			if not work_order:
+				continue
+
+			if frappe.get_cached_value("Work Order", work_order, "reserve_stock"):
+				reserved_work_orders.append(work_order)
+
+		return reserved_work_orders
 
 	@frappe.whitelist()
 	def get_item_details(self, args: ItemDetailsCtx | None = None, for_update: bool = False):
@@ -1520,10 +1475,12 @@ class StockEntry(StockController, SubcontractingInwardController):
 	def update_subcontracting_order_status(self):
 		if self.subcontracting_order and self.purpose in ["Send to Subcontractor", "Material Transfer"]:
 			from erpnext.subcontracting.doctype.subcontracting_order.subcontracting_order import (
-				update_subcontracting_order_status,
+				set_subcontracting_order_status,
 			)
 
-			update_subcontracting_order_status(self.subcontracting_order)
+			# Trusted submit/cancel flow — a Stock operation must not require Subcontracting Order
+			# write permission, so use the no-check internal helper (not the whitelisted boundary).
+			set_subcontracting_order_status(self.subcontracting_order)
 
 	def update_pick_list_status(self):
 		from erpnext.stock.doctype.pick_list.pick_list import update_pick_list_status
