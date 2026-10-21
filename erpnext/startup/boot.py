@@ -22,6 +22,12 @@ def boot_session(bootinfo):
 			frappe.get_single_value("Selling Settings", "use_legacy_js_reactivity")
 		)
 		bootinfo.sysdefaults.allow_stale = cint(frappe.get_single_value("Accounts Settings", "allow_stale"))
+		bootinfo.sysdefaults.bill_for_rejected_quantity_in_purchase_invoice = cint(
+			frappe.get_single_value("Buying Settings", "bill_for_rejected_quantity_in_purchase_invoice")
+		)
+		bootinfo.sysdefaults.set_valuation_rate_for_rejected_materials = cint(
+			frappe.get_single_value("Buying Settings", "set_valuation_rate_for_rejected_materials")
+		)
 		bootinfo.sysdefaults.over_billing_allowance = frappe.get_single_value(
 			"Accounts Settings", "over_billing_allowance"
 		)
@@ -31,8 +37,8 @@ def boot_session(bootinfo):
 
 		remove_disabled_price_list_defaults(bootinfo)
 
-		bootinfo.sysdefaults.quotation_valid_till = cint(
-			frappe.db.get_single_value("CRM Settings", "default_valid_till")
+		bootinfo.sysdefaults.quotation_valid_till = max(
+			cint(frappe.db.get_single_value("CRM Settings", "default_valid_till")), 0
 		)
 
 		bootinfo.sysdefaults.allow_sales_order_creation_for_expired_quotation = cint(

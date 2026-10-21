@@ -22,12 +22,14 @@ def validate_status(status, options):
 
 status_map = {
 	"Lead": [
+		["Open", "eval:self.status in ('Opportunity', 'Quotation', 'Lost Quotation')"],
 		["Lost Quotation", "has_lost_quotation"],
 		["Opportunity", "has_opportunity"],
 		["Quotation", "has_quotation"],
 		["Converted", "has_customer"],
 	],
 	"Opportunity": [
+		["Open", "eval:self.status=='Quotation'"],
 		["Lost", "eval:self.status=='Lost'"],
 		["Lost", "has_lost_quotation"],
 		["Quotation", "has_active_quotation"],
@@ -45,6 +47,10 @@ status_map = {
 	"Supplier Quotation": [
 		["Draft", None],
 		["Submitted", "eval:self.docstatus==1"],
+		[
+			"Expired",
+			"eval:self.docstatus==1 and self.valid_till and getdate(self.valid_till) < getdate(nowdate())",
+		],
 		["Stopped", "eval:self.status=='Stopped'"],
 		["Partially Ordered", "is_partially_ordered"],
 		["Ordered", "is_fully_ordered"],
@@ -184,6 +190,12 @@ status_map = {
 			"eval:self.purpose == 'Delivery' and self.delivery_status == 'Partly Delivered'",
 		],
 		["Completed", "eval:self.purpose == 'Delivery' and self.delivery_status == 'Fully Delivered'"],
+		["Cancelled", "eval:self.docstatus == 2"],
+	],
+	"Blanket Order": [
+		["Draft", None],
+		["Submitted", "eval:self.docstatus == 1"],
+		["Closed", "eval:self.status == 'Closed' and self.docstatus == 1"],
 		["Cancelled", "eval:self.docstatus == 2"],
 	],
 }
@@ -388,7 +400,7 @@ class StatusUpdater(Document):
 						)
 					)
 
-			if items_to_validate:
+			if items_to_validate and args.get("validate_overflow") is not False:
 				pp_sub_assembly_items = [
 					item.production_plan_sub_assembly_item
 					for item in items_to_validate
@@ -610,6 +622,12 @@ class StatusUpdater(Document):
 			if "percent_join_field" in args or "percent_join_field_parent" in args:
 				self._update_percent_field_in_targets(args, update_modified)
 
+		from erpnext.manufacturing.doctype.blanket_order.blanket_order import (
+			refresh_blanket_orders_of_fulfilled_rows,
+		)
+
+		refresh_blanket_orders_of_fulfilled_rows(self)
+
 	def _update_children(self, args, update_modified):
 		"""Update quantities or amount in child table"""
 		for d in self.get_all_children():
@@ -658,10 +676,14 @@ class StatusUpdater(Document):
 				if args["second_source_condition"]:
 					args["source_dt_value"] += flt(args["second_source_condition"])
 
+				target_value = args["source_dt_value"]
+				if args.get("target_conversion_factor"):
+					target_value = f"{target_value} / {args['target_conversion_factor']}"
+
 				frappe.db.sql(
 					"""update `tab{target_dt}`
-					set {target_field} = {source_dt_value} {update_modified}
-					where name=%(detail_id)s""".format(**args),
+					set {target_field} = {target_value} {update_modified}
+					where name=%(detail_id)s""".format(target_value=target_value, **args),
 					{"detail_id": args["detail_id"]},
 				)
 
@@ -731,8 +753,9 @@ class StatusUpdater(Document):
 		if args.get("percent_join_field_parent"):
 			# if reference to target doc where % is to be updated, is
 			# in source doc's parent form, consider percent_join_field_parent
-			args["name"] = self.get(args["percent_join_field_parent"])
-			self._update_percent_field(args, update_modified)
+			if name := self.get(args["percent_join_field_parent"]):
+				args["name"] = name
+				self._update_percent_field(args, update_modified)
 		else:
 			distinct_transactions = set(
 				d.get(args["percent_join_field"]) for d in self.get_all_children(args["source_dt"])
